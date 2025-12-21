@@ -1,200 +1,132 @@
-import pyautogui
-import pydirectinput
+"""
+Refactored Ranked Mode Bot
+Uses centralized utilities for faster development and less code duplication
+"""
+
 import pytesseract
-from PIL import Image
-import psutil
-import win32gui
-import win32process
-import win32con
 import time
 import keyboard
-import os
-import random
-import math
-from pyautogui import ImageNotFoundException
+import logging
+from PIL import Image
+from pathlib import Path
+import sys
 
-# Path to Tesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from config import TESSERACT_PATH, BUTTONS_DIR, BUTTON_OFFSETS
+from windows_manager import RobloxWindowManager
+from input_simulator import InputSimulator
+from button_detector import ButtonDetector, ButtonActions
+import pyautogui
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Setup Tesseract
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# Global stop flag
 stop_flag = False
 
 def stop_script():
     global stop_flag
     stop_flag = True
-    print("Stop hotkey pressed. Exiting...")
+    logger.info("Stop hotkey pressed. Exiting...")
 
+# Register stop hotkey
 keyboard.add_hotkey('ctrl+shift+p', stop_script)
-print("Press Ctrl+Shift+P to stop the script.")
+logger.info("Press Ctrl+Shift+P to stop the script.")
 
-def get_roblox_hwnd():
-    target_pids = set()
-    for proc in psutil.process_iter(['pid', 'exe']):
-        try:
-            exe_path = proc.info['exe']
-            if exe_path and exe_path.lower().endswith("robloxplayerbeta.exe"):
-                target_pids.add(proc.info['pid'])
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    if not target_pids:
-        return None
 
-    hwnd_match = None
-    def enum_handler(hwnd, _):
-        nonlocal hwnd_match
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd)
-        if not title or "roblox" not in title.lower():
-            return
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if pid in target_pids:
-                hwnd_match = hwnd
-        except Exception:
-            pass
-    win32gui.EnumWindows(enum_handler, None)
-    return hwnd_match
+class RankedBot:
+    """Main ranked mode automation bot"""
+    
+    def __init__(self):
+        self.window_mgr = RobloxWindowManager()
+        self.input = InputSimulator()
+        self.detector = ButtonDetector(BUTTONS_DIR)
+        self.actions = ButtonActions(self.detector, self.input)
+    
+    def dismiss_modal(self) -> bool:
+        """Find and dismiss any modal dialogs via OCR
+        
+        Returns:
+            True if dismissed, False otherwise
+        """
+        region = self.window_mgr.get_roblox_region()
+        if not region:
+            logger.error("Cannot get region")
+            return False
+        
+        screenshot = pyautogui.screenshot(region=region)
+        gray = screenshot.convert("L")
+        data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+        
+        for i, word in enumerate(data["text"]):
+            if "dismiss" in word.lower():
+                x = data["left"][i] + data["width"][i] // 2 + region[0]
+                y = data["top"][i] + data["height"][i] // 2 + region[1]
+                self.input.wiggle_and_click(x, y)
+                logger.info(f"Dismissed modal at ({x}, {y})")
+                return True
+        
+        return False
+    
+    def click_button_safe(self, button_name: str) -> bool:
+        """Safely click a button with error handling
+        
+        Returns:
+            True if clicked, False otherwise
+        """
+        offset = BUTTON_OFFSETS.get(button_name, (0, 0))
+        return self.actions.click_button(button_name, offset=offset)
+    
+    def run_loop(self) -> None:
+        """Main automation loop"""
+        global stop_flag
+        
+        while not stop_flag:
+            try:
+                # Ensure Roblox is focused
+                if not self.window_mgr.is_roblox_running():
+                    logger.error("Roblox not running. Attempting to focus...")
+                    if not self.window_mgr.focus_roblox():
+                        logger.error("Failed to focus Roblox. Retrying in 5s...")
+                        time.sleep(5)
+                        continue
+                
+                # Dismiss any popups/modals
+                self.dismiss_modal()
+                
+                # Standard action clicks
+                self.click_button_safe("fight")
+                self.click_button_safe("ranked")
+                self.click_button_safe("refresh")
+                
+                time.sleep(1)  # Main loop delay
+                
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}", exc_info=True)
+                time.sleep(2)
 
-def get_roblox_region():
-    hwnd = get_roblox_hwnd()
-    if not hwnd:
-        return None
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    return (left, top, right - left, bottom - top)
 
-def focus_roblox():
-    hwnd = get_roblox_hwnd()
-    if not hwnd:
-        print("RobloxPlayerBeta.exe window not found.")
+def main():
+    """Entry point"""
+    logger.info("Starting Ranked Bot")
+    bot = RankedBot()
+    
+    if not bot.window_mgr.focus_roblox():
+        logger.error("Cannot start: Roblox not found")
         return
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
-        time.sleep(0.1)
-        win32gui.SetForegroundWindow(hwnd)
-        time.sleep(0.1)
-        print("Roblox window maximized and focused.")
-    except Exception as e:
-        print("Failed to maximize/focus Roblox window:", e)
+    
+    bot.run_loop()
+    logger.info("Bot exited")
 
-# --- Smooth, fast human-like movement ---
-def human_move(x, y, steps=3):
-    start_x, start_y = pydirectinput.position()
-    dx = x - start_x
-    dy = y - start_y
-    for i in range(1, steps+1):
-        t = i / steps
-        ease = (1 - math.cos(t * math.pi)) / 2  # smooth easing
-        move_x = int(start_x + dx * ease)
-        move_y = int(start_y + dy * ease)
-        pydirectinput.moveTo(move_x, move_y)
-        time.sleep(random.uniform(0.0012, 0.0015))  # quick, smooth intervals
-
-def wiggle_and_click(x, y):
-    human_move(x, y)
-    # gentle wiggle
-    for _ in range(2):
-        offset_x = random.randint(-2, 2)
-        offset_y = random.randint(-1, 1)
-        pydirectinput.moveRel(offset_x, offset_y)
-        time.sleep(random.uniform(0.015, 0.019))
-        pydirectinput.moveRel(-offset_x, -offset_y)
-    pydirectinput.click()
-    # no pause after click
-
-def dismiss_modal():
-    region = get_roblox_region()
-    if not region:
-        return False
-    screenshot = pyautogui.screenshot(region=region)
-    gray = screenshot.convert("L")
-    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
-    for i, word in enumerate(data["text"]):
-        if "dismiss" in word.lower():
-            x = data["left"][i] + data["width"][i] // 2 + region[0]
-            y = data["top"][i] + data["height"][i] // 2 + region[1]
-            wiggle_and_click(x, y)
-            print(f"Dismissed modal at ({x}, {y})")
-            return True
-    return False
-
-def click_fight():
-    try:
-        if not os.path.exists("fight_button.png"):
-            print("Missing template: fight_button.png")
-            return False
-        location = pyautogui.locateCenterOnScreen("fight_button.png", confidence=0.8)
-        if location:
-            x, y = location
-            wiggle_and_click(x, y)
-            print("Clicked Fight button")
-            return True
-        print("Fight button not found on screen.")
-        return False
-    except ImageNotFoundException:
-        print("Fight button not found (exception).")
-        return False
-
-def click_ranked():
-    try:
-        if not os.path.exists("ranked_button.png"):
-            print("Missing template: ranked_button.png")
-            return False
-        location = pyautogui.locateCenterOnScreen("ranked_button.png", confidence=0.8)
-        if location:
-            x, y = location
-            wiggle_and_click(x, y - 15)
-            print("Clicked Ranked button")
-            return True
-        print("Ranked button not found on screen.")
-        return False
-    except ImageNotFoundException:
-        print("Ranked button not found (exception).")
-        return False
-
-def click_refresh():
-    try:
-        if not os.path.exists("refresh_button.png"):
-            print("Missing template: refresh_button.png")
-            return False
-        location = pyautogui.locateCenterOnScreen("refresh_button.png", confidence=0.8)
-        if location:
-            x, y = location
-            wiggle_and_click(x, y)
-            print("Clicked Refresh button")
-            return True
-        print("Refresh button not found on screen.")
-        return False
-    except ImageNotFoundException:
-        print("Refresh button not found (exception).")
-        return False
-
-def click_reconnect():
-    region = get_roblox_region()
-    if not region:
-        return False
-    screenshot = pyautogui.screenshot(region=region)
-    gray = screenshot.convert("L")
-    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
-    for i, word in enumerate(data["text"]):
-        if "reconnect" in word.lower():
-            x = data["left"][i] + data["width"][i] // 2 + region[0]
-            y = data["top"][i] + data["height"][i] // 2 + region[1]
-            wiggle_and_click(x, y)
-            print(f"Clicked Reconnect at ({x}, {y})")
-            return True
-    print("Reconnect text not found on screen.")
-    return False
-
-# --- Main Loop ---
-def main_loop():
-    global stop_flag
-    while not stop_flag:
-        focus_roblox()
-        dismiss_modal()
-        click_reconnect()
-        click_fight()
-        click_ranked()
-        click_refresh()
 
 if __name__ == "__main__":
-    main_loop()
+    main()
